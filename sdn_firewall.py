@@ -4,6 +4,8 @@ from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
 from ryu.controller.handler import set_ev_cls
 from ryu.ofproto import ofproto_v1_3
 from ryu.lib.packet import packet, ethernet, ipv4, arp
+from collections import defaultdict
+import time
 
 class SDNFirewall(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
@@ -23,6 +25,11 @@ class SDNFirewall(app_manager.RyuApp):
         self.internal_ports = {1, 2}  # internal ports
         self.external_ports = {3, 4}  # external ports
 
+        # DDoS protection parameters
+        self.ddos_window = 5  # Time window (seconds)
+        self.ddos_threshold = 2  # Maximum allowed different source IPs
+        self.ip_tracker = defaultdict(lambda: {'ips': set(), 'time': time.time()})
+
         # debug switch
         self.debug = True
 
@@ -31,14 +38,35 @@ class SDNFirewall(app_manager.RyuApp):
         if self.debug:
             self.logger.info(msg, *args)
 
+    # check if MAC address is allowed
     def _check_mac(self, src_mac, in_port):
-        # check if MAC address is allowed
         if in_port in self.external_ports:
             if src_mac not in self.allowed_macs:
                 self._log("Blocked unauthorized MAC: %s from port %s", src_mac, in_port)
                 return False
         return True
-    
+
+    # detect DDoS attack
+    def _is_ddos_attack(self, dst_ip, src_ip):
+        current_time = time.time()
+        tracker = self.ip_tracker[dst_ip]
+        
+        # reset expired statistics
+        if current_time - tracker['time'] > self.ddos_window:
+            self._log("Resetting DDoS counter for %s", dst_ip)
+            tracker['ips'].clear()
+            tracker['time'] = current_time
+        
+        # record new source IP
+        tracker['ips'].add(src_ip)
+        
+        # check if threshold is exceeded
+        if len(tracker['ips']) > self.ddos_threshold:
+            self._log("DDoS threshold exceeded for %s: %d different IPs", 
+                     dst_ip, len(tracker['ips']))
+            return True
+        return False
+
     # handle switch connection event
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
@@ -77,6 +105,7 @@ class SDNFirewall(app_manager.RyuApp):
 
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocol(ethernet.ethernet)
+        ip = pkt.get_protocol(ipv4.ipv4)
 
         # print debug info
         self._log("\nPacket in %s %s %s %s", datapath.id, eth.src, eth.dst, in_port)
@@ -84,6 +113,20 @@ class SDNFirewall(app_manager.RyuApp):
         # filter MAC addr
         if not self._check_mac(eth.src, in_port):
             return
+
+        # DDoS protection (only check IP packets from external to internal)
+        if ip and in_port in self.external_ports:
+            if ip.dst.startswith('10.0.'):  # target is internal IP
+                if self._is_ddos_attack(ip.dst, ip.src):
+                    self._log("Blocked DDoS attack from %s to %s", ip.src, ip.dst)
+                    # add temporary drop rule
+                    match = parser.OFPMatch(
+                        eth_type=0x0800,  # IPv4
+                        ipv4_src=ip.src,
+                        ipv4_dst=ip.dst
+                    )
+                    self.add_flow(datapath, 2, match, [], hard_timeout=10)  # empty actions == drop
+                    return
 
         # learn MAC address
         dpid = datapath.id
@@ -101,9 +144,23 @@ class SDNFirewall(app_manager.RyuApp):
 
         # install flow entry (if not broadcast)
         if out_port != ofproto.OFPP_FLOOD:
-            match = parser.OFPMatch(in_port=in_port, eth_dst=eth.dst, eth_src=eth.src)
-            # add timeout
+            if ip:
+                # use more precise matching for IP packets
+                match = parser.OFPMatch(
+                    in_port=in_port,
+                    eth_type=0x0800,  # IPv4
+                    ipv4_src=ip.src,
+                    ipv4_dst=ip.dst
+                )
+            else:
+                # use MAC matching for non-IP packets
+                match = parser.OFPMatch(
+                    in_port=in_port,
+                    eth_dst=eth.dst,
+                    eth_src=eth.src
+                )
             self.add_flow(datapath, 1, match, actions, hard_timeout=30)
+
 
         # send packet
         data = None
