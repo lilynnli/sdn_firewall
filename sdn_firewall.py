@@ -40,10 +40,10 @@ class SDNFirewall(app_manager.RyuApp):
 
     # check if MAC address is allowed
     def _check_mac(self, src_mac, in_port, dst_mac):
-        if in_port in self.external_ports:
-            if dst_mac in self.external_ports:
+        if in_port not in self.internal_ports: # not in security zone
+            if dst_mac not in self.internal_ports: # communication outside of security zone
                 return True
-            if src_mac not in self.allowed_macs:
+            if src_mac not in self.allowed_macs: # not in allowed list (external users)
                 self._log("Blocked unauthorized MAC: %s from port %s", src_mac, in_port)
                 return False
         return True
