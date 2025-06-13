@@ -27,8 +27,12 @@ class SDNFirewall(app_manager.RyuApp):
 
         # DDoS protection parameters
         self.ddos_window = 5  # Time window (seconds)
-        self.ddos_threshold = 2  # Maximum allowed different source IPs
-        self.ip_tracker = defaultdict(lambda: {'ips': set(), 'time': time.time()})
+        self.ddos_threshold = 5  # Maximum allowed requests per IP
+        self.total_ddos_threshold = 25  # Maximum allowed total requests
+        self.ip_tracker = defaultdict(lambda: {
+            'ip_counts': defaultdict(int),  # request count for each IP
+            'time': time.time(),  # last request time
+        })
 
         # debug switch
         self.debug = True
@@ -56,16 +60,23 @@ class SDNFirewall(app_manager.RyuApp):
         # reset expired statistics
         if current_time - tracker['time'] > self.ddos_window:
             self._log("Resetting DDoS counter for %s", dst_ip)
-            tracker['ips'].clear()
+            tracker['ip_counts'].clear()
             tracker['time'] = current_time
         
-        # record new source IP
-        tracker['ips'].add(src_ip)
+        # record new request
+        tracker['ip_counts'][src_ip] += 1
+        
+        # calculate total requests
+        total_requests = sum(tracker['ip_counts'].values())
         
         # check if threshold is exceeded
-        if len(tracker['ips']) > self.ddos_threshold:
-            self._log("DDoS threshold exceeded for %s: %d different IPs", 
-                     dst_ip, len(tracker['ips']))
+        if total_requests > self.total_ddos_threshold:
+            self._log("Total DDoS threshold exceeded for %s: %d total requests from %d different IPs", 
+                     dst_ip, total_requests, len(tracker['ip_counts']))
+            return True
+        elif tracker['ip_counts'][src_ip] > self.ddos_threshold:
+            self._log("Per-IP DDoS threshold exceeded for %s: %d requests from IP %s", 
+                     dst_ip, tracker['ip_counts'][src_ip], src_ip)
             return True
         return False
 
