@@ -39,8 +39,10 @@ class SDNFirewall(app_manager.RyuApp):
             self.logger.info(msg, *args)
 
     # check if MAC address is allowed
-    def _check_mac(self, src_mac, in_port):
+    def _check_mac(self, src_mac, in_port, dst_mac):
         if in_port in self.external_ports:
+            if dst_mac in self.external_ports:
+                return True
             if src_mac not in self.allowed_macs:
                 self._log("Blocked unauthorized MAC: %s from port %s", src_mac, in_port)
                 return False
@@ -111,7 +113,7 @@ class SDNFirewall(app_manager.RyuApp):
         self._log("\nPacket in %s %s %s %s", datapath.id, eth.src, eth.dst, in_port)
 
         # filter MAC addr
-        if not self._check_mac(eth.src, in_port):
+        if not self._check_mac(eth.src, in_port, eth.dst):
             return
 
         # DDoS protection (only check IP packets from external to internal)
