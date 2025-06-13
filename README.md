@@ -23,7 +23,7 @@ The project also includes a DDoS detection and mitigation mechanism within the S
 The system monitors how many requests each device on the external segment sends to each device inside the internal network.
    -  For every device inside the internal network, the system keeps track of both the number of requests from each individual external device and the overall total number of requests from all external devices.
    -  If the number of requests from one external device exceeds a certain limit, or the total number of requests from all external devices combined exceeds another limit within a short time window, the system identifies this as a potential DDoS attack.
-   -  When an attack is detected, further traffic from the offending external device to the targeted internal device is temporarily blocked for a set period (e.g., 10 seconds).
+   -  When an attack is detected, further traffic from the offending external device to the targeted internal device is temporarily blocked for a set period.
    -  DDoS detection and blocking are applied only to connections coming from external devices into the internal network. 
 
 ## System Requirements
