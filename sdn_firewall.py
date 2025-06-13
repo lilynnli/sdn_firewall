@@ -128,7 +128,7 @@ class SDNFirewall(app_manager.RyuApp):
             return
 
         # DDoS protection (only check IP packets from external to internal)
-        if ip and in_port in self.external_ports:
+        if ip and in_port not in self.internal_ports:
             if ip.dst.startswith('10.0.'):  # target is internal IP
                 if self._is_ddos_attack(ip.dst, ip.src):
                     self._log("Blocked DDoS attack from %s to %s", ip.src, ip.dst)
