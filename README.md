@@ -10,6 +10,22 @@ This is an SDN firewall implementation based on Ryu controller and Mininet, prov
 - Automatic MAC address learning
 - Automatic flow table rule deployment
 
+## Security-Enhanced SDN (mac-filtering) Logic
+This project implements an SDN-based firewall that separates an internal (secure) network from an external (DMZ) segment, using MAC address filtering to control access.
+
+- Internal Ports: All traffic between hosts on internal ports is permitted. Connections initiated from internal to external ports are also allowed without restrictions.
+ -    External Ports:Traffic coming from external ports into the internal network is only allowed if the device's MAC address is present in a predefined whitelist.
+    Communication between devices connected to external ports (external-to-external) is permitted.
+   
+## DDoS mitigation in SDN Logic
+The project also includes a DDoS detection and mitigation mechanism within the SDN controller.
+
+The system monitors how many requests each device on the external segment sends to each device inside the internal network.
+   -  For every device inside the internal network, the system keeps track of both the number of requests from each individual external device and the overall total number of requests from all external devices.
+   -  If the number of requests from one external device exceeds a certain limit, or the total number of requests from all external devices combined exceeds another limit within a short time window, the system identifies this as a potential DDoS attack.
+   -  When an attack is detected, further traffic from the offending external device to the targeted internal device is temporarily blocked for a set period (e.g., 10 seconds).
+   -  DDoS detection and blocking are applied only to connections coming from external devices into the internal network (for example, from external ports to addresses starting with 10.0.).
+
 ## System Requirements
 
 - Python 3.x
