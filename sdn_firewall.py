@@ -3,10 +3,12 @@ from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
 from ryu.controller.handler import set_ev_cls
 from ryu.ofproto import ofproto_v1_3
-from ryu.lib.packet import packet, ethernet, ipv4, arp
-from collections import defaultdict
+from ryu.lib.packet import packet, ethernet, ipv4, arp, tcp, udp
+from collections import defaultdict, namedtuple
 import time
 import threading
+
+FirewallRule = namedtuple('FirewallRule', ['proto', 'src_ip', 'dst_ip', 'src_port', 'dst_port', 'action'])
 
 class SDNFirewall(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
@@ -21,6 +23,8 @@ class SDNFirewall(app_manager.RyuApp):
             '00:00:00:00:00:02',  # h2
             '00:00:00:00:00:04'   # h4 permitted external users
         }
+        # Firewall rules list
+        self.firewall_rules = []  # List of FirewallRule
         
         # sort of ports
         self.internal_ports = {1, 2}  # internal ports
@@ -45,11 +49,11 @@ class SDNFirewall(app_manager.RyuApp):
         # debug switch
         self.debug = True
 
-        # Start MAC CLI thread
+        # Start MAC & Firewall CLI thread
         threading.Thread(target=self.mac_cli, args=(), daemon=True).start()
 
     def mac_cli(self):
-        print("MAC CLI started. Commands: addmac <mac>, delmac <mac>, listmac, exit")
+        print("MAC/Firewall CLI started. Commands: addmac <mac>, delmac <mac>, listmac, addrule <proto> <src_ip> <dst_ip> <src_port> <dst_port> <action>, delrule <rule_id>, listrules, exit")
         while True:
             try:
                 cmd = input(">>> ").strip()
@@ -65,11 +69,68 @@ class SDNFirewall(app_manager.RyuApp):
                 print(f"Removed {mac} from whitelist.")
             elif cmd == "listmac":
                 print("Current whitelist:", self.allowed_macs)
+            elif cmd.startswith("addrule "):
+                try:
+                    _, proto, src_ip, dst_ip, src_port, dst_port, action = cmd.split()
+                    rule = FirewallRule(proto.upper(), src_ip, dst_ip, src_port, dst_port, action.upper())
+                    self.firewall_rules.append(rule)
+                    print(f"Added rule #{len(self.firewall_rules)-1}: {rule}")
+                except Exception as e:
+                    print("Usage: addrule <proto> <src_ip> <dst_ip> <src_port> <dst_port> <action>")
+            elif cmd.startswith("delrule "):
+                try:
+                    idx = int(cmd.split()[1])
+                    if 0 <= idx < len(self.firewall_rules):
+                        print(f"Deleted rule #{idx}: {self.firewall_rules[idx]}")
+                        self.firewall_rules.pop(idx)
+                    else:
+                        print("Invalid rule id.")
+                except Exception as e:
+                    print("Usage: delrule <rule_id>")
+            elif cmd == "listrules":
+                if not self.firewall_rules:
+                    print("No firewall rules.")
+                for i, rule in enumerate(self.firewall_rules):
+                    print(f"#{i}: {rule}")
             elif cmd == "exit":
-                print("Exiting MAC CLI (controller keeps running).")
+                print("Exiting MAC/Firewall CLI (controller keeps running).")
                 break
             else:
                 print("Unknown command.")
+
+    def match_rule(self, pkt, rule):
+        # Only match IPv4 packets
+        ip = pkt.get_protocol(ipv4.ipv4)
+        if not ip:
+            return False
+        # Protocol
+        if rule.proto != '*' and rule.proto != 'ALL':
+            if rule.proto == 'TCP':
+                l4 = pkt.get_protocol(tcp.tcp)
+                if not l4:
+                    return False
+            elif rule.proto == 'UDP':
+                l4 = pkt.get_protocol(udp.udp)
+                if not l4:
+                    return False
+            else:
+                return False
+        # Src IP
+        if rule.src_ip != '*' and rule.src_ip != ip.src:
+            return False
+        # Dst IP
+        if rule.dst_ip != '*' and rule.dst_ip != ip.dst:
+            return False
+        # Src Port
+        l4 = pkt.get_protocol(tcp.tcp) or pkt.get_protocol(udp.udp)
+        if rule.src_port != '*' and l4:
+            if str(l4.src_port) != rule.src_port:
+                return False
+        # Dst Port
+        if rule.dst_port != '*' and l4:
+            if str(l4.dst_port) != rule.dst_port:
+                return False
+        return True
 
     # debug logging function
     def _log(self, msg, *args):
@@ -183,6 +244,22 @@ class SDNFirewall(app_manager.RyuApp):
             if (ip.src, ip.dst) in self.ddos_blacklist:
                 self._log("Blocked by DDoS blacklist: %s -> %s", ip.src, ip.dst)
                 return
+
+        # firewall rules check (highest priority)
+        for rule in self.firewall_rules:
+            if self.match_rule(pkt, rule):
+                self._log("Firewall rule matched: %s", rule)
+                if rule.action == 'DENY':
+                    # drop packet and install drop flow
+                    match = parser.OFPMatch(
+                        eth_type=0x0800,
+                        ipv4_src=ip.src,
+                        ipv4_dst=ip.dst
+                    )
+                    self.add_flow(datapath, 10, match, [], hard_timeout=30)
+                    return
+                elif rule.action == 'ALLOW':
+                    break  # allow, continue normal processing
 
         # filter MAC addr
         if not self._check_mac(eth.src, in_port, eth.dst):
