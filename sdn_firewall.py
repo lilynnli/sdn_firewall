@@ -33,6 +33,13 @@ class SDNFirewall(app_manager.RyuApp):
             'ip_counts': defaultdict(int),  # request count for each IP
             'time': time.time(),  # last request time
         })
+        # DDoS blacklist: (src_ip, dst_ip) -> unblock_time
+        self.ddos_blacklist = {}  # key: (src_ip, dst_ip), value: unblock_time (timestamp)
+        # Exponential backoff for DDoS
+        self.ddos_strikes = {}  # key: (src_ip, dst_ip), value: (strike_count, last_strike_time)
+        self.ddos_base_block = 60      # 60 seconds
+        self.ddos_max_block = 3600     # 1 hour
+        self.ddos_reset_window = 600   # 10 minutes
 
         # debug switch
         self.debug = True
@@ -80,6 +87,20 @@ class SDNFirewall(app_manager.RyuApp):
             return True
         return False
 
+    def _handle_ddos_block(self, src_ip, dst_ip):
+        now = time.time()
+        key = (src_ip, dst_ip)
+        count, last_time = self.ddos_strikes.get(key, (0, 0))
+        # Reset strike count if last strike was long ago
+        if now - last_time > self.ddos_reset_window:
+            count = 0
+        count += 1
+        self.ddos_strikes[key] = (count, now)
+        block_time = min(self.ddos_base_block * (2 ** (count - 1)), self.ddos_max_block)
+        self.ddos_blacklist[key] = now + block_time
+        self._log("DDoS block: %s -> %s, strikes=%d, block_time=%ds", src_ip, dst_ip, count, block_time)
+        return block_time
+
     # handle switch connection event
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
@@ -123,6 +144,19 @@ class SDNFirewall(app_manager.RyuApp):
         # print debug info
         self._log("\nPacket in %s %s %s %s", datapath.id, eth.src, eth.dst, in_port)
 
+        # clean expired blacklist entries
+        now = time.time()
+        expired = [(s, d) for (s, d), t in self.ddos_blacklist.items() if t <= now]
+        for key in expired:
+            del self.ddos_blacklist[key]
+            self._log("Unblocked DDoS IP pair: %s -> %s", key[0], key[1])
+
+        # DDoS blacklist check
+        if ip:
+            if (ip.src, ip.dst) in self.ddos_blacklist:
+                self._log("Blocked by DDoS blacklist: %s -> %s", ip.src, ip.dst)
+                return
+
         # filter MAC addr
         if not self._check_mac(eth.src, in_port, eth.dst):
             return
@@ -132,13 +166,15 @@ class SDNFirewall(app_manager.RyuApp):
             if ip.dst.startswith('10.0.'):  # target is internal IP
                 if self._is_ddos_attack(ip.dst, ip.src):
                     self._log("Blocked DDoS attack from %s to %s", ip.src, ip.dst)
+                    # exponential backoff block
+                    block_time = self._handle_ddos_block(ip.src, ip.dst)
                     # add temporary drop rule
                     match = parser.OFPMatch(
                         eth_type=0x0800,  # IPv4
                         ipv4_src=ip.src,
                         ipv4_dst=ip.dst
                     )
-                    self.add_flow(datapath, 2, match, [], hard_timeout=10)  # empty actions == drop
+                    self.add_flow(datapath, 2, match, [], hard_timeout=int(block_time)) # empty actions == drop
                     return
 
         # learn MAC address
@@ -173,7 +209,6 @@ class SDNFirewall(app_manager.RyuApp):
                     eth_src=eth.src
                 )
             self.add_flow(datapath, 1, match, actions, hard_timeout=30)
-
 
         # send packet
         data = None
