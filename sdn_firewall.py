@@ -6,6 +6,7 @@ from ryu.ofproto import ofproto_v1_3
 from ryu.lib.packet import packet, ethernet, ipv4, arp
 from collections import defaultdict
 import time
+import threading
 
 class SDNFirewall(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
@@ -43,6 +44,32 @@ class SDNFirewall(app_manager.RyuApp):
 
         # debug switch
         self.debug = True
+
+        # Start MAC CLI thread
+        threading.Thread(target=self.mac_cli, args=(), daemon=True).start()
+
+    def mac_cli(self):
+        print("MAC CLI started. Commands: addmac <mac>, delmac <mac>, listmac, exit")
+        while True:
+            try:
+                cmd = input(">>> ").strip()
+            except EOFError:
+                break
+            if cmd.startswith("addmac "):
+                mac = cmd.split()[1]
+                self.allowed_macs.add(mac)
+                print(f"Added {mac} to whitelist.")
+            elif cmd.startswith("delmac "):
+                mac = cmd.split()[1]
+                self.allowed_macs.discard(mac)
+                print(f"Removed {mac} from whitelist.")
+            elif cmd == "listmac":
+                print("Current whitelist:", self.allowed_macs)
+            elif cmd == "exit":
+                print("Exiting MAC CLI (controller keeps running).")
+                break
+            else:
+                print("Unknown command.")
 
     # debug logging function
     def _log(self, msg, *args):
