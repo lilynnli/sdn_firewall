@@ -4,8 +4,8 @@ This is an SDN firewall implementation based on Ryu controller and Mininet, prov
 
 ## Features
 
-- MAC address whitelist filtering
-- DDoS attack detection and protection
+- MAC address whitelist filtering: you can add or remove MAC addresses dynamically using the built-in command-line interface (CLI) during controller runtime
+- DDoS attack detection and protection: the controller uses time-windowed tracking and exponential backoff to detect and block DDoS attempts automatically
 - Internal/External network isolation
 - Automatic MAC address learning
 - Automatic flow table rule deployment
@@ -14,7 +14,7 @@ This is an SDN firewall implementation based on Ryu controller and Mininet, prov
 This project implements an SDN-based firewall that separates an internal (secure) network from an external (DMZ) segment, using MAC address filtering to control access.
 
 - Internal Ports: All traffic between hosts on internal ports is permitted. Connections initiated from internal to external ports are also allowed without restrictions.
- -    External Ports:Traffic coming from external ports into the internal network is only allowed if the device's MAC address is in a whitelist.
+ -    External Ports: Traffic coming from external ports into the internal network is only allowed if the device's MAC address is in a whitelist.
     Communication between devices connected to external ports (external-to-external) is permitted.
    
 ## DDoS mitigation in SDN logic
@@ -23,8 +23,15 @@ The project also includes a DDoS detection and mitigation mechanism within the S
 The system monitors how many requests each device on the external segment sends to each device inside the internal network.
    -  For every device inside the internal network, the system keeps track of both the number of requests from each individual external device and the overall total number of requests from all external devices.
    -  If the number of requests from one external device exceeds a certain limit, or the total number of requests from all external devices combined exceeds another limit within a short time window, the system identifies this as a potential DDoS attack.
-   -  When an attack is detected, further traffic from the detected external device is temporarily blocked for a set period.
+   -  When an attack is detected, ffurther traffic from the detected external device is temporarily blocked (with exponential backoff for repeated attempts).
    -  DDoS detection and blocking are applied only to connections coming from external devices into the internal network. 
+
+## Dynamic CLI Interface
+
+While the controller is running, you can:
+   - Add/remove MAC addresses to/from the whitelist
+   - Add/remove/list firewall rules (protocol, IP, port, action)
+   - Exit the CLI (controller keeps running)
 
 ## System Requirements
 
