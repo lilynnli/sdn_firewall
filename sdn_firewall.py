@@ -6,6 +6,7 @@ from ryu.ofproto import ofproto_v1_3
 from ryu.lib.packet import packet, ethernet, ipv4, arp, tcp, udp
 from collections import defaultdict, namedtuple
 import time
+import socket
 import threading
 
 FirewallRule = namedtuple('FirewallRule', ['proto', 'src_ip', 'dst_ip', 'src_port', 'dst_port', 'action'])
@@ -18,17 +19,12 @@ class SDNFirewall(app_manager.RyuApp):
         # MAC address table
         self.mac_to_port = {}
         # MAC whitelist
-        self.allowed_macs = {
-            '00:00:00:00:00:01',  # h1
-            '00:00:00:00:00:02',  # h2
-            '00:00:00:00:00:04'   # h4 permitted external users
-        }
+        self.whitelist_macs = set()  # Whitelisted MACs (external allowed)
+        self.internal_macs = set()   # Internal network MACs
+        self.internal_ports = set()  # Ports where internal MACs are observed
+
         # Firewall rules list
         self.firewall_rules = []  # List of FirewallRule
-        
-        # sort of ports
-        self.internal_ports = {1, 2}  # internal ports
-        self.external_ports = {3, 4}  # external ports
 
         # DDoS protection parameters
         self.ddos_window = 5  # Time window (seconds)
@@ -48,55 +44,8 @@ class SDNFirewall(app_manager.RyuApp):
 
         # debug switch
         self.debug = True
+        threading.Thread(target=self.start_cli_server, args=(), daemon=True).start()
 
-        # Start MAC & Firewall CLI thread
-        # threading.Thread(target=self.mac_cli, args=(), daemon=True).start()
-
-    # def mac_cli(self):
-    #     print("MAC/Firewall CLI started. Commands: addmac <mac>, delmac <mac>, listmac, addrule <proto> <src_ip> <dst_ip> <src_port> <dst_port> <action>, delrule <rule_id>, listrules, exit")
-    #     while True:
-    #         try:
-    #             cmd = input(">>> ").strip()
-    #         except EOFError:
-    #             break
-    #         if cmd.startswith("addmac "):
-    #             mac = cmd.split()[1]
-    #             self.allowed_macs.add(mac)
-    #             print(f"Added {mac} to whitelist.")
-    #         elif cmd.startswith("delmac "):
-    #             mac = cmd.split()[1]
-    #             self.allowed_macs.discard(mac)
-    #             print(f"Removed {mac} from whitelist.")
-    #         elif cmd == "listmac":
-    #             print("Current whitelist:", self.allowed_macs)
-    #         elif cmd.startswith("addrule "):
-    #             try:
-    #                 _, proto, src_ip, dst_ip, src_port, dst_port, action = cmd.split()
-    #                 rule = FirewallRule(proto.upper(), src_ip, dst_ip, src_port, dst_port, action.upper())
-    #                 self.firewall_rules.append(rule)
-    #                 print(f"Added rule #{len(self.firewall_rules)-1}: {rule}")
-    #             except Exception as e:
-    #                 print("Usage: addrule <proto> <src_ip> <dst_ip> <src_port> <dst_port> <action>")
-    #         elif cmd.startswith("delrule "):
-    #             try:
-    #                 idx = int(cmd.split()[1])
-    #                 if 0 <= idx < len(self.firewall_rules):
-    #                     print(f"Deleted rule #{idx}: {self.firewall_rules[idx]}")
-    #                     self.firewall_rules.pop(idx)
-    #                 else:
-    #                     print("Invalid rule id.")
-    #             except Exception as e:
-    #                 print("Usage: delrule <rule_id>")
-    #         elif cmd == "listrules":
-    #             if not self.firewall_rules:
-    #                 print("No firewall rules.")
-    #             for i, rule in enumerate(self.firewall_rules):
-    #                 print(f"#{i}: {rule}")
-    #         elif cmd == "exit":
-    #             print("Exiting MAC/Firewall CLI (controller keeps running).")
-    #             break
-    #         else:
-    #             print("Unknown command.")
 
     def match_rule(self, pkt, rule):
         # Only match IPv4 packets
@@ -137,14 +86,49 @@ class SDNFirewall(app_manager.RyuApp):
         if self.debug:
             self.logger.info(msg, *args)
 
-    # check if MAC address is allowed
-    def _check_mac(self, src_mac, in_port, dst_mac):
-        if in_port not in self.internal_ports: # not in security zone
-            if dst_mac not in self.internal_ports: # communication outside of security zone
-                return True
-            if src_mac not in self.allowed_macs: # not in allowed list (external users)
-                self._log("Blocked unauthorized MAC: %s from port %s", src_mac, in_port)
-                return False
+    def add_whitelist_mac(self, mac):
+        self.whitelist_macs.add(mac)
+        self._log("Added MAC %s to whitelist", mac)
+
+    def del_whitelist_mac(self, mac):
+        if mac in self.whitelist_macs:
+            self.whitelist_macs.remove(mac)
+            self._log("Removed MAC %s from whitelist", mac)
+            self._remove_flows_by_mac(mac)
+
+    def add_internal_mac(self, mac):
+        self.internal_macs.add(mac)
+        self._log("Added MAC %s to internal_macs", mac)
+
+    def del_internal_mac(self, mac):
+        if mac in self.internal_macs:
+            self.internal_macs.remove(mac)
+            self._log("Removed MAC %s from internal_macs", mac)
+            self._remove_flows_by_mac(mac)
+
+    def _remove_flows_by_mac(self, mac):
+        # Remove all flows related to this MAC on all datapaths
+        for dp in getattr(self, 'datapaths', {}).values():
+            parser = dp.ofproto_parser
+            ofproto = dp.ofproto
+            match = parser.OFPMatch(eth_src=mac)
+            mod = parser.OFPFlowMod(
+                datapath=dp,
+                command=ofproto.OFPFC_DELETE,
+                out_port=ofproto.OFPP_ANY,
+                out_group=ofproto.OFPG_ANY,
+                match=match
+            )
+            dp.send_msg(mod)
+
+    def _is_valid_mac(self, src_mac, dst_mac, in_port):
+        if src_mac in self.internal_macs:
+            if in_port not in self.internal_ports:
+                self.internal_ports.add(in_port)
+            return True
+        elif src_mac not in self.whitelist_macs:
+            if dst_mac in self.internal_macs:
+                return False        
         return True
 
     # detect DDoS attack
@@ -189,6 +173,53 @@ class SDNFirewall(app_manager.RyuApp):
         self._log("DDoS block: %s -> %s, strikes=%d, block_time=%ds", src_ip, dst_ip, count, block_time)
         return block_time
 
+    def start_cli_server(self, host='127.0.0.1', port=9999):
+        def handle_client(conn):
+            data = conn.recv(1024).decode().strip()
+            resp = self.handle_cli_cmd(data)
+            conn.sendall(resp.encode())
+            conn.close()
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((host, port))
+        s.listen(5)
+        self._log("CLI server listening on %s:%d", host, port)
+        while True:
+            conn, _ = s.accept()
+            threading.Thread(target=handle_client, args=(conn,)).start()
+
+    def handle_cli_cmd(self, cmd):
+        parts = cmd.strip().split()
+        if not parts:
+            return "Empty command"
+        action = parts[0].lower()
+        if action == "addmac":
+            if len(parts) == 3 and parts[1] == "whitelist":
+                self.add_whitelist_mac(parts[2])
+                return f"Added {parts[2]} to whitelist"
+            elif len(parts) == 3 and parts[1] == "internal":
+                self.add_internal_mac(parts[2])
+                return f"Added {parts[2]} to internal_macs"
+            else:
+                return "Usage: addmac whitelist|internal <mac>"
+        elif action == "delmac":
+            if len(parts) == 3 and parts[1] == "whitelist":
+                self.del_whitelist_mac(parts[2])
+                return f"Removed {parts[2]} from whitelist"
+            elif len(parts) == 3 and parts[1] == "internal":
+                self.del_internal_mac(parts[2])
+                return f"Removed {parts[2]} from internal_macs"
+            else:
+                return "Usage: delmac whitelist|internal <mac>"
+        elif action == "listmac":
+            return f"Whitelist: {self.whitelist_macs}\nInternal: {self.internal_macs}"
+        else:
+            return
+
+    def is_multicast_or_broadcast(self, mac):
+        mac = mac.lower()
+        return mac.startswith('33') or mac == 'ff:ff:ff:ff:ff:ff'
+
     # handle switch connection event
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
@@ -229,8 +260,10 @@ class SDNFirewall(app_manager.RyuApp):
         eth = pkt.get_protocol(ethernet.ethernet)
         ip = pkt.get_protocol(ipv4.ipv4)
 
-        # print debug info
-        self._log("\nPacket in %s %s %s %s", datapath.id, eth.src, eth.dst, in_port)
+        # print debug info (suppress log for 33:33 multicast and broadcast)
+        if not self.is_multicast_or_broadcast(eth.dst):
+            # return  # Completely skip further processing/logging for these packets
+            self._log("\nPacket in %s %s %s %s", datapath.id, eth.src, eth.dst, in_port)
 
         # clean expired blacklist entries
         now = time.time()
@@ -262,7 +295,25 @@ class SDNFirewall(app_manager.RyuApp):
                     break  # allow, continue normal processing
 
         # filter MAC addr
-        if not self._check_mac(eth.src, in_port, eth.dst):
+        if not self._is_valid_mac(eth.src, eth.dst, in_port):
+            # Install drop flow before return
+            if ip:
+                match = parser.OFPMatch(
+                    in_port=in_port,
+                    eth_src=eth.src,
+                    eth_dst=eth.dst,
+                    eth_type=0x0800,
+                    ipv4_src=ip.src,
+                    ipv4_dst=ip.dst
+                )
+            else:
+                match = parser.OFPMatch(
+                    in_port=in_port,
+                    eth_src=eth.src,
+                    eth_dst=eth.dst
+                )
+            self.add_flow(datapath, 20, match, [], hard_timeout=30)
+            self._log("Drop flow installed for non-whitelisted MAC %s from port %s", eth.src, in_port)
             return
 
         # DDoS protection (only check IP packets from external to internal)
@@ -280,6 +331,23 @@ class SDNFirewall(app_manager.RyuApp):
                     )
                     self.add_flow(datapath, 2, match, [], hard_timeout=int(block_time)) # empty actions == drop
                     return
+
+        arp_pkt = pkt.get_protocol(arp.arp)
+        if arp_pkt:
+            # Install a flow to flood all ARP packets
+            match = parser.OFPMatch(eth_type=0x0806)
+            actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
+            self.add_flow(datapath, 5, match, actions, hard_timeout=60)
+            # Immediately flood this ARP packet
+            out = parser.OFPPacketOut(
+                datapath=datapath,
+                buffer_id=msg.buffer_id,
+                in_port=in_port,
+                actions=actions,
+                data=msg.data if msg.buffer_id == ofproto.OFP_NO_BUFFER else None
+            )
+            datapath.send_msg(out)
+            return
 
         # learn MAC address
         dpid = datapath.id
