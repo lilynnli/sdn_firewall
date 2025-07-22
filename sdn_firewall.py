@@ -50,53 +50,53 @@ class SDNFirewall(app_manager.RyuApp):
         self.debug = True
 
         # Start MAC & Firewall CLI thread
-        threading.Thread(target=self.mac_cli, args=(), daemon=True).start()
+        # threading.Thread(target=self.mac_cli, args=(), daemon=True).start()
 
-    def mac_cli(self):
-        print("MAC/Firewall CLI started. Commands: addmac <mac>, delmac <mac>, listmac, addrule <proto> <src_ip> <dst_ip> <src_port> <dst_port> <action>, delrule <rule_id>, listrules, exit")
-        while True:
-            try:
-                cmd = input(">>> ").strip()
-            except EOFError:
-                break
-            if cmd.startswith("addmac "):
-                mac = cmd.split()[1]
-                self.allowed_macs.add(mac)
-                print(f"Added {mac} to whitelist.")
-            elif cmd.startswith("delmac "):
-                mac = cmd.split()[1]
-                self.allowed_macs.discard(mac)
-                print(f"Removed {mac} from whitelist.")
-            elif cmd == "listmac":
-                print("Current whitelist:", self.allowed_macs)
-            elif cmd.startswith("addrule "):
-                try:
-                    _, proto, src_ip, dst_ip, src_port, dst_port, action = cmd.split()
-                    rule = FirewallRule(proto.upper(), src_ip, dst_ip, src_port, dst_port, action.upper())
-                    self.firewall_rules.append(rule)
-                    print(f"Added rule #{len(self.firewall_rules)-1}: {rule}")
-                except Exception as e:
-                    print("Usage: addrule <proto> <src_ip> <dst_ip> <src_port> <dst_port> <action>")
-            elif cmd.startswith("delrule "):
-                try:
-                    idx = int(cmd.split()[1])
-                    if 0 <= idx < len(self.firewall_rules):
-                        print(f"Deleted rule #{idx}: {self.firewall_rules[idx]}")
-                        self.firewall_rules.pop(idx)
-                    else:
-                        print("Invalid rule id.")
-                except Exception as e:
-                    print("Usage: delrule <rule_id>")
-            elif cmd == "listrules":
-                if not self.firewall_rules:
-                    print("No firewall rules.")
-                for i, rule in enumerate(self.firewall_rules):
-                    print(f"#{i}: {rule}")
-            elif cmd == "exit":
-                print("Exiting MAC/Firewall CLI (controller keeps running).")
-                break
-            else:
-                print("Unknown command.")
+    # def mac_cli(self):
+    #     print("MAC/Firewall CLI started. Commands: addmac <mac>, delmac <mac>, listmac, addrule <proto> <src_ip> <dst_ip> <src_port> <dst_port> <action>, delrule <rule_id>, listrules, exit")
+    #     while True:
+    #         try:
+    #             cmd = input(">>> ").strip()
+    #         except EOFError:
+    #             break
+    #         if cmd.startswith("addmac "):
+    #             mac = cmd.split()[1]
+    #             self.allowed_macs.add(mac)
+    #             print(f"Added {mac} to whitelist.")
+    #         elif cmd.startswith("delmac "):
+    #             mac = cmd.split()[1]
+    #             self.allowed_macs.discard(mac)
+    #             print(f"Removed {mac} from whitelist.")
+    #         elif cmd == "listmac":
+    #             print("Current whitelist:", self.allowed_macs)
+    #         elif cmd.startswith("addrule "):
+    #             try:
+    #                 _, proto, src_ip, dst_ip, src_port, dst_port, action = cmd.split()
+    #                 rule = FirewallRule(proto.upper(), src_ip, dst_ip, src_port, dst_port, action.upper())
+    #                 self.firewall_rules.append(rule)
+    #                 print(f"Added rule #{len(self.firewall_rules)-1}: {rule}")
+    #             except Exception as e:
+    #                 print("Usage: addrule <proto> <src_ip> <dst_ip> <src_port> <dst_port> <action>")
+    #         elif cmd.startswith("delrule "):
+    #             try:
+    #                 idx = int(cmd.split()[1])
+    #                 if 0 <= idx < len(self.firewall_rules):
+    #                     print(f"Deleted rule #{idx}: {self.firewall_rules[idx]}")
+    #                     self.firewall_rules.pop(idx)
+    #                 else:
+    #                     print("Invalid rule id.")
+    #             except Exception as e:
+    #                 print("Usage: delrule <rule_id>")
+    #         elif cmd == "listrules":
+    #             if not self.firewall_rules:
+    #                 print("No firewall rules.")
+    #             for i, rule in enumerate(self.firewall_rules):
+    #                 print(f"#{i}: {rule}")
+    #         elif cmd == "exit":
+    #             print("Exiting MAC/Firewall CLI (controller keeps running).")
+    #             break
+    #         else:
+    #             print("Unknown command.")
 
     def match_rule(self, pkt, rule):
         # Only match IPv4 packets
