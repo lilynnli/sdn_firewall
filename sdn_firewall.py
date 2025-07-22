@@ -9,8 +9,6 @@ import time
 import socket
 import threading
 
-FirewallRule = namedtuple('FirewallRule', ['proto', 'src_ip', 'dst_ip', 'src_port', 'dst_port', 'action'])
-
 class SDNFirewall(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
