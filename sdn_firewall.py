@@ -23,9 +23,6 @@ class SDNFirewall(app_manager.RyuApp):
         self.internal_macs = set()   # Internal network MACs
         self.internal_ports = set()  # Ports where internal MACs are observed
 
-        # Firewall rules list
-        self.firewall_rules = []  # List of FirewallRule
-
         # DDoS protection parameters
         self.ddos_window = 5  # 5 seconds window
         self.ddos_threshold = 5  # Single IP threshold
@@ -53,40 +50,6 @@ class SDNFirewall(app_manager.RyuApp):
         self.realtime_ddos_total_threshold = 25
         self.realtime_ddos_state = defaultdict(lambda: {'start': 0, 'per_src': defaultdict(int), 'total': 0})
 
-
-    def match_rule(self, pkt, rule):
-        # Only match IPv4 packets
-        ip = pkt.get_protocol(ipv4.ipv4)
-        if not ip:
-            return False
-        # Protocol
-        if rule.proto != '*' and rule.proto != 'ALL':
-            if rule.proto == 'TCP':
-                l4 = pkt.get_protocol(tcp.tcp)
-                if not l4:
-                    return False
-            elif rule.proto == 'UDP':
-                l4 = pkt.get_protocol(udp.udp)
-                if not l4:
-                    return False
-            else:
-                return False
-        # Src IP
-        if rule.src_ip != '*' and rule.src_ip != ip.src:
-            return False
-        # Dst IP
-        if rule.dst_ip != '*' and rule.dst_ip != ip.dst:
-            return False
-        # Src Port
-        l4 = pkt.get_protocol(tcp.tcp) or pkt.get_protocol(udp.udp)
-        if rule.src_port != '*' and l4:
-            if str(l4.src_port) != rule.src_port:
-                return False
-        # Dst Port
-        if rule.dst_port != '*' and l4:
-            if str(l4.dst_port) != rule.dst_port:
-                return False
-        return True
 
     # debug logging function
     def _log(self, msg, *args):
@@ -319,22 +282,6 @@ class SDNFirewall(app_manager.RyuApp):
                     self.add_flow(datapath, 20, match, [], hard_timeout=int(block_time))
                     return
 
-        # firewall rules check (highest priority)
-        for rule in self.firewall_rules:
-            if self.match_rule(pkt, rule):
-                self._log("Firewall rule matched: %s", rule)
-                if rule.action == 'DENY':
-                    # drop packet and install drop flow
-                    match = parser.OFPMatch(
-                        eth_type=0x0800,
-                        ipv4_src=ip.src,
-                        ipv4_dst=ip.dst
-                    )
-                    self.add_flow(datapath, 10, match, [], hard_timeout=30)
-                    return
-                elif rule.action == 'ALLOW':
-                    break  # allow, continue normal processing
-
         # filter MAC addr
         if not self._is_valid_mac(eth.src, eth.dst, in_port):
             # Install drop flow before return
@@ -357,6 +304,8 @@ class SDNFirewall(app_manager.RyuApp):
             self._log("Drop flow installed for non-whitelisted MAC %s from port %s", eth.src, in_port)
             return
 
+        # ARP packet handling
+        # Ensure that all hosts in the network topology can correctly learn and parse ARP to achieve IP communication.
         arp_pkt = pkt.get_protocol(arp.arp)
         if arp_pkt:
             # Install a flow to flood all ARP packets
