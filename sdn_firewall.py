@@ -35,19 +35,6 @@ class SDNFirewall(app_manager.RyuApp):
         # debug switch
         self.debug = True
         threading.Thread(target=self.start_cli_server, args=(), daemon=True).start()
-        self.flow_stats_window = 5  # seconds
-        self.flow_stats_interval = 1  # seconds
-        self.flow_stats_history = defaultdict(list)  # dst_ip -> list of (timestamp, count)
-        self.flow_stats_blacklist = {}  # (src_ip, dst_ip) -> unblock_time
-        self.flow_stats_strikes = {}    # (src_ip, dst_ip) -> strike_count
-        threading.Thread(target=self._periodic_flow_stats, daemon=True).start()
-        self.last_packet_count = {}  # (src_ip, dst_ip) -> last_count
-        self.realtime_ddos_counter = defaultdict(lambda: {'count': 0, 'start': 0})
-        self.realtime_ddos_window = 5
-        self.realtime_ddos_threshold = 5
-        self.realtime_ddos_total_threshold = 25
-        self.realtime_ddos_state = defaultdict(lambda: {'start': 0, 'per_src': defaultdict(int), 'total': 0})
-
 
     # debug logging function
     def _log(self, msg, *args):
@@ -212,47 +199,7 @@ class SDNFirewall(app_manager.RyuApp):
 
         # print debug info (suppress log for 33:33 multicast and broadcast)
         if not self.is_multicast_or_broadcast(eth.dst):
-            # return  # Completely skip further processing/logging for these packets
             self._log("\nPacket in %s %s %s %s", datapath.id, eth.src, eth.dst, in_port)
-
-        # Real-time DDoS detection and blocking 
-        # (from outside to inside, if more than 5 packets are received within 5 seconds, they will be blocked immediately)
-        if ip and in_port not in self.internal_ports and eth.dst in self.internal_macs:
-            dst_ip = ip.dst
-            src_ip = ip.src
-            now = time.time()
-            state = self.realtime_ddos_state[dst_ip]
-            # Reset window if expired
-            if state['start'] == 0 or now - state['start'] > self.realtime_ddos_window:
-                state['start'] = now
-                state['per_src'] = defaultdict(int)
-                state['total'] = 0
-            state['per_src'][src_ip] += 1
-            state['total'] += 1
-            # Check threshold
-            if state['per_src'][src_ip] > self.realtime_ddos_threshold or state['total'] > self.realtime_ddos_total_threshold:
-                # block the src_ip to dst_ip
-                match = parser.OFPMatch(
-                    eth_type=0x0800,
-                    ipv4_src=src_ip,
-                    ipv4_dst=dst_ip
-                )
-                self.add_flow(datapath, 30, match, [], hard_timeout=self.ddos_base_block)
-                self._log("Realtime DDoS block: %s -> %s, src_count=%d, total=%d", src_ip, dst_ip, state['per_src'][src_ip], state['total'])
-                # Clear the src_ip count to prevent repeated blocking
-                state['per_src'][src_ip] = 0
-                return
-            # If not over threshold, forward normally, do not install allow flow table
-            actions = [parser.OFPActionOutput(ofproto.OFPP_TABLE)]
-            out = parser.OFPPacketOut(
-                datapath=datapath,
-                buffer_id=msg.buffer_id,
-                in_port=in_port,
-                actions=actions,
-                data=msg.data if msg.buffer_id == ofproto.OFP_NO_BUFFER else None
-            )
-            datapath.send_msg(out)
-            return
 
         # DDoS blacklist check
         if ip:
@@ -335,24 +282,25 @@ class SDNFirewall(app_manager.RyuApp):
         # create forwarding action
         actions = [parser.OFPActionOutput(out_port)]
 
-        # install flow entry (if not broadcast)
-        if out_port != ofproto.OFPP_FLOOD:
-            if ip:
-                # use more precise matching for IP packets
-                match = parser.OFPMatch(
-                    in_port=in_port,
-                    eth_type=0x0800,  # IPv4
-                    ipv4_src=ip.src,
-                    ipv4_dst=ip.dst
-                )
-            else:
-                # use MAC matching for non-IP packets
-                match = parser.OFPMatch(
-                    in_port=in_port,
-                    eth_dst=eth.dst,
-                    eth_src=eth.src
-                )
-            self.add_flow(datapath, 1, match, actions, hard_timeout=30)
+        # Only send the allowed flow table for non-external to internal traffic
+        if not (in_port not in self.internal_ports and eth.dst in self.internal_macs):
+            if out_port != ofproto.OFPP_FLOOD:
+                if ip:
+                    # use more precise matching for IP packets
+                    match = parser.OFPMatch(
+                        in_port=in_port,
+                        eth_type=0x0800,  # IPv4
+                        ipv4_src=ip.src,
+                        ipv4_dst=ip.dst
+                    )
+                else:
+                    # use MAC matching for non-IP packets
+                    match = parser.OFPMatch(
+                        in_port=in_port,
+                        eth_dst=eth.dst,
+                        eth_src=eth.src
+                    )
+                self.add_flow(datapath, 1, match, actions, hard_timeout=30)
 
         # send packet
         data = None
@@ -368,14 +316,6 @@ class SDNFirewall(app_manager.RyuApp):
         )
         datapath.send_msg(out)
 
-    def _periodic_flow_stats(self):
-        while True:
-            for dp in getattr(self, 'datapaths', {}).values():
-                parser = dp.ofproto_parser
-                req = parser.OFPFlowStatsRequest(dp)
-                dp.send_msg(req)
-            time.sleep(self.flow_stats_interval)
-
     @set_ev_cls(ofp_event.EventOFPStateChange, [MAIN_DISPATCHER, CONFIG_DISPATCHER])
     def _state_change_handler(self, ev):
         dp = ev.datapath
@@ -385,58 +325,3 @@ class SDNFirewall(app_manager.RyuApp):
         elif ev.state == 'DEAD':
             if hasattr(self, 'datapaths') and dp.id in self.datapaths:
                 del self.datapaths[dp.id]
-
-    @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
-    def _flow_stats_reply_handler(self, ev):
-        now = time.time()
-        # Only count traffic from outside to inside
-        per_dst = defaultdict(lambda: defaultdict(int))  # dst_ip -> src_ip -> count
-        last_packet_count = getattr(self, 'last_packet_count', {})
-        if not last_packet_count:
-            last_packet_count = {}
-        for stat in ev.msg.body:
-            if stat.match.get('eth_type') == 0x0800:  # IPv4
-                src_ip = stat.match.get('ipv4_src')
-                dst_ip = stat.match.get('ipv4_dst')
-                in_port = stat.match.get('in_port')
-                # Only count traffic from outside to inside
-                if src_ip and dst_ip and in_port is not None:
-                    if hasattr(self, 'internal_ports') and hasattr(self, 'internal_macs'):
-                        if in_port not in self.internal_ports and dst_ip in self.internal_macs:
-                            key = (src_ip, dst_ip, in_port)
-                            last = last_packet_count.get(key, 0)
-                            new_packets = stat.packet_count - last
-                            if new_packets > 0:
-                                per_dst[dst_ip][src_ip] += new_packets
-                            last_packet_count[key] = stat.packet_count
-        self.last_packet_count = last_packet_count
-        # DDoS detection and blocking
-        for dst_ip, src_counts in per_dst.items():
-            total = sum(src_counts.values())
-            for src_ip, cnt in src_counts.items():
-                key = (src_ip, dst_ip)
-                if cnt > self.ddos_threshold or total > self.total_ddos_threshold:
-                    now = time.time()
-                    if key not in self.flow_stats_blacklist or self.flow_stats_blacklist[key] < now:
-                        strikes = self.flow_stats_strikes.get(key, 0) + 1
-                        self.flow_stats_strikes[key] = strikes
-                        block_time = min(self.ddos_base_block + (strikes - 1) * self.ddos_add_block, self.ddos_max_block)
-                        self.flow_stats_blacklist[key] = now + block_time
-                        self._log("DDoS block (stats): %s -> %s, strikes=%d, block_time=%ds", src_ip, dst_ip, strikes, block_time)
-                        # Install drop flow table, high priority, precise matching
-                        for dp in getattr(self, 'datapaths', {}).values():
-                            parser = dp.ofproto_parser
-                            ofproto = dp.ofproto
-                            match = parser.OFPMatch(
-                                eth_type=0x0800,
-                                ipv4_src=src_ip,
-                                ipv4_dst=dst_ip
-                            )
-                            mod = parser.OFPFlowMod(
-                                datapath=dp,
-                                priority=30,
-                                match=match,
-                                instructions=[],
-                                hard_timeout=int(block_time)
-                            )
-                            dp.send_msg(mod)
